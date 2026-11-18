@@ -90,9 +90,11 @@ cosign verify ghcr.io/think-cube/<image>:<version> \
 
 ## helm-chart
 
-Every run lints the chart with `helm lint --strict` and validates the rendered manifests with kubeconform. It then installs the chart into a kind cluster, waits for it to become ready and runs `helm test`.
+Every run lints the chart with `helm lint --strict` and validates the rendered manifests with kubeconform: Kubernetes resources against the official schemas, custom resources such as KEDA's against the [CRDs catalog](https://github.com/datreeio/CRDs-catalog). It then installs the chart into a kind cluster, waits for it to become ready and runs `helm test`.
 
 When the chart has `ci/*-values.yaml` files, each check runs once per file instead of with the default values. Use them to cover the configurations that matter, such as an optional component switched on.
+
+When the chart has `ci/setup.sh`, it runs against the kind cluster before the installs. Use it to install what the chart depends on, such as an operator and its CRDs.
 
 On `v*` tags it also packages the chart, pushes it to GitHub Container Registry as an OCI artifact and signs it with keyless Cosign. The tag must match `version` in `Chart.yaml`, and a release fails instead of overwriting a version that already exists. If the chart directory contains `artifacthub-repo.yml`, it is pushed as Artifact Hub repository metadata.
 
@@ -117,7 +119,7 @@ jobs:
       contents: read
       id-token: write
       packages: write
-    uses: Think-Cube/workflows/.github/workflows/helm-chart.yml@v1.1.0
+    uses: Think-Cube/workflows/.github/workflows/helm-chart.yml@v1.2.0
 ```
 
 ### Inputs
@@ -129,6 +131,8 @@ jobs:
 | `kubernetes-version` | `1.34.12` | Kubernetes version the rendered manifests are validated against |
 | `kind-node-image` | `kindest/node:v1.35.8@sha256:...` | kind node image the chart is installed into |
 | `registry-path` | `charts` | Path under `ghcr.io/<owner>` the chart is pushed to |
+| `setup-script` | `ci/setup.sh` | Script run against the kind cluster before installing; skipped when missing |
+| `wait` | `watcher` | Helm wait strategy for the test install. Use `legacy` when the chart creates custom resources that only become ready with a real backend. |
 
 ### Verify a published chart
 

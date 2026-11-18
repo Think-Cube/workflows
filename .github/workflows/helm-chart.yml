@@ -28,6 +28,16 @@ on:
         required: false
         type: string
         default: charts
+      setup-script:
+        description: Script run against the kind cluster before installing, for example to install CRDs the chart depends on. Skipped when the file does not exist.
+        required: false
+        type: string
+        default: ci/setup.sh
+      wait:
+        description: Helm wait strategy for the test install, watcher or legacy. Use legacy when the chart creates custom resources that only become ready with a real backend.
+        required: false
+        type: string
+        default: watcher
 
 permissions: {}
 
@@ -57,9 +67,13 @@ jobs:
             [ -n "$file" ] && args=(--values "$file")
             echo "::group::${file:-default values}"
             helm lint --strict "$CHART" "${args[@]}"
+            # Custom resources are checked against the CRDs catalog, Kubernetes ones against the default schemas.
             helm template ci "$CHART" "${args[@]}" --kube-version "$KUBE_VERSION" \
               | docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
-                  -strict -summary -kubernetes-version "$KUBE_VERSION" -
+                  -strict -summary -kubernetes-version "$KUBE_VERSION" \
+                  -schema-location default \
+                  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+                  -
             echo "::endgroup::"
           done
 
@@ -78,9 +92,19 @@ jobs:
       - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           node_image: ${{ inputs.kind-node-image }}
+      - name: Prepare the cluster
+        env:
+          SETUP_SCRIPT: ${{ inputs.setup-script }}
+        run: |
+          if [ -f "$SETUP_SCRIPT" ]; then
+            bash "$SETUP_SCRIPT"
+          else
+            echo "No $SETUP_SCRIPT; nothing to prepare"
+          fi
       - name: Install and run helm test
         env:
           CHART: ${{ inputs.chart-path }}
+          WAIT: ${{ inputs.wait }}
         run: |
           shopt -s nullglob
           values=("$CHART"/ci/*-values.yaml)
@@ -93,7 +117,7 @@ jobs:
             [ -n "$file" ] && args=(--values "$file")
             echo "::group::Install with ${file:-default values}"
             if ! helm install "$release" "$CHART" "${args[@]}" \
-                --namespace "$release" --create-namespace --wait --timeout 10m; then
+                --namespace "$release" --create-namespace --wait="$WAIT" --timeout 10m; then
               kubectl --namespace "$release" get all,pvc
               kubectl --namespace "$release" describe pods
               kubectl --namespace "$release" logs --all-containers --tail 100 \
