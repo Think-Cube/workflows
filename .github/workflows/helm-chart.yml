@@ -1,0 +1,208 @@
+name: Helm chart
+
+on:
+  workflow_call:
+    inputs:
+      chart-path:
+        description: Directory that contains Chart.yaml
+        required: false
+        type: string
+        default: .
+      helm-version:
+        description: Helm version to use
+        required: false
+        type: string
+        default: v4.3.2
+      kubernetes-version:
+        description: Kubernetes version the rendered manifests are validated against
+        required: false
+        type: string
+        default: 1.34.12
+      kind-node-image:
+        description: kind node image the chart is installed into
+        required: false
+        type: string
+        default: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+      registry-path:
+        description: Path under ghcr.io/<owner> the chart is pushed to
+        required: false
+        type: string
+        default: charts
+
+permissions: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: ${{ inputs.helm-version }}
+      - name: Lint and validate manifests
+        env:
+          CHART: ${{ inputs.chart-path }}
+          KUBE_VERSION: ${{ inputs.kubernetes-version }}
+        run: |
+          # Charts with ci/*-values.yaml are checked with each of those files, otherwise with the defaults.
+          shopt -s nullglob
+          values=("$CHART"/ci/*-values.yaml)
+          [ ${#values[@]} -eq 0 ] && values=("")
+          for file in "${values[@]}"; do
+            args=()
+            [ -n "$file" ] && args=(--values "$file")
+            echo "::group::${file:-default values}"
+            helm lint --strict "$CHART" "${args[@]}"
+            helm template ci "$CHART" "${args[@]}" --kube-version "$KUBE_VERSION" \
+              | docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+                  -strict -summary -kubernetes-version "$KUBE_VERSION" -
+            echo "::endgroup::"
+          done
+
+  test:
+    needs: lint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: ${{ inputs.helm-version }}
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          node_image: ${{ inputs.kind-node-image }}
+      - name: Install and run helm test
+        env:
+          CHART: ${{ inputs.chart-path }}
+        run: |
+          shopt -s nullglob
+          values=("$CHART"/ci/*-values.yaml)
+          [ ${#values[@]} -eq 0 ] && values=("")
+          i=0
+          for file in "${values[@]}"; do
+            i=$((i + 1))
+            release=ci-$i
+            args=()
+            [ -n "$file" ] && args=(--values "$file")
+            echo "::group::Install with ${file:-default values}"
+            if ! helm install "$release" "$CHART" "${args[@]}" \
+                --namespace "$release" --create-namespace --wait --timeout 10m; then
+              kubectl --namespace "$release" get all,pvc
+              kubectl --namespace "$release" describe pods
+              kubectl --namespace "$release" logs --all-containers --tail 100 \
+                --selector "app.kubernetes.io/instance=$release" || true
+              exit 1
+            fi
+            helm test "$release" --namespace "$release" --logs
+            echo "::endgroup::"
+          done
+
+  publish:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: ${{ inputs.helm-version }}
+      - name: Package
+        id: chart
+        env:
+          CHART: ${{ inputs.chart-path }}
+          REGISTRY_PATH: ${{ inputs.registry-path }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          name=$(helm show chart "$CHART" | awk '/^name:/ { print $2 }')
+          version=$(helm show chart "$CHART" | awk '/^version:/ { print $2 }')
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match the chart version $version in Chart.yaml"
+            exit 1
+          fi
+          helm package "$CHART" --destination dist
+          {
+            echo "name=$name"
+            echo "version=$version"
+            echo "package=dist/$name-$version.tgz"
+            echo "registry=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$REGISTRY_PATH"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Push
+        id: push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.chart.outputs.name }}
+          VERSION: ${{ steps.chart.outputs.version }}
+          PACKAGE: ${{ steps.chart.outputs.package }}
+          REGISTRY: ${{ steps.chart.outputs.registry }}
+        run: |
+          echo "$GH_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          if helm show chart "oci://$REGISTRY/$NAME" --version "$VERSION" > /dev/null 2>&1; then
+            echo "::error::$REGISTRY/$NAME:$VERSION already exists; release a new version instead"
+            exit 1
+          fi
+          output=$(helm push "$PACKAGE" "oci://$REGISTRY" 2>&1)
+          echo "$output"
+          digest=$(grep -oE 'sha256:[0-9a-f]{64}' <<< "$output" | head -1)
+          if [ -z "$digest" ]; then
+            echo "::error::Could not read the pushed digest"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: Sign the chart
+        env:
+          NAME: ${{ steps.chart.outputs.name }}
+          REGISTRY: ${{ steps.chart.outputs.registry }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$REGISTRY/$NAME@$DIGEST"
+      - name: Check for Artifact Hub metadata
+        id: artifacthub
+        env:
+          CHART: ${{ inputs.chart-path }}
+        run: |
+          if [ -f "$CHART/artifacthub-repo.yml" ]; then
+            echo "file=$CHART/artifacthub-repo.yml" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: oras-project/setup-oras@ac735097e22fe643015b0d19645f7c9a69942128 # v2.0.4
+        if: steps.artifacthub.outputs.file != ''
+      - name: Push Artifact Hub metadata
+        if: steps.artifacthub.outputs.file != ''
+        env:
+          FILE: ${{ steps.artifacthub.outputs.file }}
+          NAME: ${{ steps.chart.outputs.name }}
+          REGISTRY: ${{ steps.chart.outputs.registry }}
+        run: |
+          cd "$(dirname "$FILE")"
+          oras push "$REGISTRY/$NAME:artifacthub.io" \
+            --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+            "$(basename "$FILE"):application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml"
+      - name: Write summary
+        env:
+          NAME: ${{ steps.chart.outputs.name }}
+          VERSION: ${{ steps.chart.outputs.version }}
+          REGISTRY: ${{ steps.chart.outputs.registry }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "Published \`oci://$REGISTRY/$NAME\` version \`$VERSION\`"
+            echo
+            echo "Digest: \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"

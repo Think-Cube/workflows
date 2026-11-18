@@ -7,6 +7,7 @@ Reusable GitHub Actions workflows for Think-Cube repositories.
 | Workflow | Purpose |
 |---|---|
 | [`container-image.yml`](.github/workflows/container-image.yml) | Lint, test, scan, sign and publish a multi-arch container image |
+| [`helm-chart.yml`](.github/workflows/helm-chart.yml) | Lint, validate, install, sign and publish a Helm chart as an OCI artifact |
 
 ## container-image
 
@@ -85,6 +86,56 @@ A release fails instead of overwriting a version that already exists in GitHub C
 cosign verify ghcr.io/think-cube/<image>:<version> \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github\.com/Think-Cube/workflows/\.github/workflows/container-image\.yml@refs/tags/v.+$'
+```
+
+## helm-chart
+
+Every run lints the chart with `helm lint --strict` and validates the rendered manifests with kubeconform. It then installs the chart into a kind cluster, waits for it to become ready and runs `helm test`.
+
+When the chart has `ci/*-values.yaml` files, each check runs once per file instead of with the default values. Use them to cover the configurations that matter, such as an optional component switched on.
+
+On `v*` tags it also packages the chart, pushes it to GitHub Container Registry as an OCI artifact and signs it with keyless Cosign. The tag must match `version` in `Chart.yaml`, and a release fails instead of overwriting a version that already exists. If the chart directory contains `artifacthub-repo.yml`, it is pushed as Artifact Hub repository metadata.
+
+### Usage
+
+```yaml
+name: Chart
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  chart:
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    uses: Think-Cube/workflows/.github/workflows/helm-chart.yml@v1.1.0
+```
+
+### Inputs
+
+| Input | Default | Description |
+|---|---|---|
+| `chart-path` | `.` | Directory that contains `Chart.yaml` |
+| `helm-version` | `v4.3.2` | Helm version to use |
+| `kubernetes-version` | `1.34.12` | Kubernetes version the rendered manifests are validated against |
+| `kind-node-image` | `kindest/node:v1.35.8@sha256:...` | kind node image the chart is installed into |
+| `registry-path` | `charts` | Path under `ghcr.io/<owner>` the chart is pushed to |
+
+### Verify a published chart
+
+```bash
+cosign verify ghcr.io/think-cube/charts/<chart>:<version> \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/Think-Cube/workflows/\.github/workflows/helm-chart\.yml@refs/tags/v.+$'
 ```
 
 ## Versioning
