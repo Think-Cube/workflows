@@ -8,6 +8,7 @@ Reusable GitHub Actions workflows for Think-Cube repositories.
 |---|---|
 | [`container-image.yml`](.github/workflows/container-image.yml) | Lint, test, scan, sign and publish a multi-arch container image |
 | [`helm-chart.yml`](.github/workflows/helm-chart.yml) | Lint, validate, install, sign and publish a Helm chart as an OCI artifact |
+| [`version-check.yml`](.github/workflows/version-check.yml) | Open an issue when versions Dependabot does not track have newer releases |
 
 ## container-image
 
@@ -141,6 +142,64 @@ cosign verify ghcr.io/think-cube/charts/<chart>:<version> \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github\.com/Think-Cube/workflows/\.github/workflows/helm-chart\.yml@refs/tags/v.+$'
 ```
+
+## version-check
+
+Dependabot keeps base images, packages and actions current, but it cannot see versions pinned in build arguments, Helm values or Git commits, and it deliberately skips updates such as a new RabbitMQ minor. This workflow compares those pins with the latest releases and keeps a single issue, labelled `version-check`, up to date: it opens the issue when something is outdated, updates it as findings change and closes it once everything is current. It does not change any files, because these updates usually need a manual step.
+
+### Usage
+
+```yaml
+name: Version check
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    permissions:
+      contents: read
+      issues: write
+    uses: Think-Cube/workflows/.github/workflows/version-check.yml@v1.3.0
+```
+
+### Configuration
+
+List the checks in `.github/version-check.yml`:
+
+```yaml
+checks:
+  - name: Azure Pipelines agent
+    file: Dockerfile
+    pattern: 'ARG AGENT_VERSION=(\S+)'
+    source: github-release
+    repository: microsoft/azure-pipelines-agent
+    note: Update both checksums too.
+  - name: curl used by helm test
+    file: values.yaml
+    path: .test.image.tag
+    pattern: '^([^@]+)'
+    source: docker-hub
+    repository: curlimages/curl
+    tag-pattern: '(\d+\.\d+\.\d+)'
+```
+
+| Key | Description |
+|---|---|
+| `name` | Shown in the issue |
+| `file` | File that pins the version |
+| `path` | Optional yq path to the value in a YAML file |
+| `pattern` | Regular expression whose first group is the pinned version, applied to the `path` value or to the whole file |
+| `source` | `github-release` (latest release tag), `github-commit` (head of the default branch) or `docker-hub` (highest matching tag) |
+| `repository` | `owner/repo` on GitHub, or `namespace/name` on Docker Hub (`library/<name>` for official images) |
+| `tag-pattern` | For `docker-hub`: tags to consider; its first group, if any, is the version compared |
+| `note` | Optional instruction shown in the issue |
+
+Versions are compared numerically, and commits by identity. A check that cannot run fails the workflow without affecting the others.
 
 ## Versioning
 

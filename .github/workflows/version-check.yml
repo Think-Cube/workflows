@@ -1,0 +1,160 @@
+name: Version check
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: File that lists the versions to check
+        required: false
+        type: string
+        default: .github/version-check.yml
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare pinned versions with the latest ones
+        id: compare
+        env:
+          CONFIG: ${{ inputs.config }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          yq -o=json . "$CONFIG" > "$RUNNER_TEMP/version-check.json"
+          python3 - "$RUNNER_TEMP/version-check.json" "$RUNNER_TEMP/version-check.md" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import urllib.request
+
+          config_path, report_path = sys.argv[1], sys.argv[2]
+          checks = json.load(open(config_path))["checks"]
+          token = os.environ.get("GH_TOKEN", "")
+
+
+          def get(url, github=False):
+              headers = {"Accept": "application/json", "User-Agent": "think-cube-version-check"}
+              if github and token:
+                  headers["Authorization"] = f"Bearer {token}"
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+                  return json.load(response)
+
+
+          def version_key(version):
+              return tuple(int(n) for n in re.findall(r"\d+", version))
+
+
+          def pinned(check):
+              # A yq path reads a value from YAML; a pattern then picks the version out of it, or out of the whole file.
+              if "path" in check:
+                  text = subprocess.run(["yq", check["path"], check["file"]],
+                                        check=True, capture_output=True, text=True).stdout.strip()
+              else:
+                  text = open(check["file"]).read()
+              pattern = check.get("pattern", "(.+)")
+              match = re.search(pattern, text, re.MULTILINE)
+              if not match:
+                  raise ValueError(f"'{pattern}' matches nothing in {check['file']}")
+              return match.group(1)
+
+
+          def latest(check):
+              source, repository = check["source"], check["repository"]
+              if source == "github-release":
+                  release = get(f"https://api.github.com/repos/{repository}/releases/latest", github=True)
+                  return release["tag_name"].removeprefix("v"), release["html_url"]
+              if source == "github-commit":
+                  commit = get(f"https://api.github.com/repos/{repository}/commits/HEAD", github=True)
+                  return commit["sha"], commit["html_url"]
+              if source == "docker-hub":
+                  tag_pattern = re.compile(check["tag-pattern"])
+                  url = f"https://hub.docker.com/v2/repositories/{repository}/tags?page_size=100&ordering=last_updated"
+                  versions = []
+                  for _ in range(3):
+                      page = get(url)
+                      for tag in page["results"]:
+                          match = tag_pattern.fullmatch(tag["name"])
+                          if match:
+                              versions.append(match.group(1) if match.groups() else tag["name"])
+                      url = page.get("next")
+                      if not url:
+                          break
+                  if not versions:
+                      raise ValueError(f"no tag of {repository} matches '{check['tag-pattern']}'")
+                  namespace, name = repository.split("/")
+                  link = f"https://hub.docker.com/_/{name}" if namespace == "library" else f"https://hub.docker.com/r/{repository}"
+                  return max(versions, key=version_key), link
+              raise ValueError(f"unknown source '{source}'")
+
+
+          def short(value):
+              return value[:7] if re.fullmatch(r"[0-9a-f]{40}", value) else value
+
+
+          outdated, notes, errors = [], [], []
+          for check in checks:
+              try:
+                  current = pinned(check)
+                  newest, link = latest(check)
+                  if check["source"] == "github-commit":
+                      is_newer = current != newest
+                  else:
+                      is_newer = version_key(newest) > version_key(current)
+                  print(f"{check['name']}: pinned {short(current)}, latest {short(newest)}")
+                  if is_newer:
+                      outdated.append(f"| {check['name']} | `{check['file']}` | `{short(current)}` | [`{short(newest)}`]({link}) |")
+                      if check.get("note"):
+                          notes.append(f"- **{check['name']}:** {check['note']}")
+              except Exception as error:
+                  errors.append(f"{check['name']}: {error}")
+                  print(f"::error::{check['name']}: {error}")
+
+          lines = [
+              "The weekly version check found newer versions of pinned dependencies.",
+              "",
+              "| Dependency | File | Pinned | Latest |",
+              "|---|---|---|---|",
+              *outdated,
+          ]
+          if notes:
+              lines += ["", "### Notes", "", *notes]
+          lines += ["", "This issue is updated by the weekly version check and closes itself once everything is up to date."]
+          with open(report_path, "w") as report:
+              report.write("\n".join(lines) + "\n")
+
+          with open(os.environ.get("GITHUB_OUTPUT", os.devnull), "a") as output:
+              output.write(f"outdated={len(outdated)}\nerrors={len(errors)}\n")
+          PY
+      - name: Open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          OUTDATED: ${{ steps.compare.outputs.outdated }}
+          ERRORS: ${{ steps.compare.outputs.errors }}
+        run: |
+          label=version-check
+          gh label create "$label" --color 0E8A16 --description "Opened by the weekly version check" --force > /dev/null
+          number=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
+          if [ "$OUTDATED" -gt 0 ]; then
+            if [ -n "$number" ]; then
+              gh issue edit "$number" --body-file "$RUNNER_TEMP/version-check.md"
+            else
+              gh issue create --title "Newer versions of pinned dependencies are available" \
+                --label "$label" --body-file "$RUNNER_TEMP/version-check.md"
+            fi
+          elif [ -n "$number" ]; then
+            gh issue close "$number" --comment "Everything is up to date."
+          fi
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS check(s) could not run; see the errors above"
+            exit 1
+          fi
