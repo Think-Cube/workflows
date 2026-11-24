@@ -1,0 +1,145 @@
+name: Terraform module
+
+on:
+  workflow_call:
+    inputs:
+      terraform-versions:
+        description: JSON array of Terraform versions the tests run with; include the oldest version the module supports
+        required: false
+        type: string
+        default: '["1.14.9", "1.17.2"]'
+      tflint-version:
+        description: TFLint version to use
+        required: false
+        type: string
+        default: v0.66.0
+      tflint-azurerm-version:
+        description: Version of the TFLint azurerm ruleset, used when the repository has no .tflint.hcl
+        required: false
+        type: string
+        default: 0.33.0
+      terraform-docs-version:
+        description: terraform-docs version that checks the README
+        required: false
+        type: string
+        default: v0.25.1
+      trivy-severity:
+        description: Misconfiguration severities that fail the build
+        required: false
+        type: string
+        default: CRITICAL,HIGH
+
+permissions: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ fromJSON(inputs.terraform-versions)[0] }}
+          terraform_wrapper: false
+      - name: Check formatting
+        run: terraform fmt -check -recursive -diff
+      - name: Validate the module and its examples
+        run: |
+          for dir in . examples/*/; do
+            [ -d "$dir" ] || continue
+            echo "::group::terraform validate $dir"
+            terraform -chdir="$dir" init -backend=false -input=false > /dev/null
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: ${{ inputs.tflint-version }}
+      - name: Lint with TFLint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          AZURERM_RULESET: ${{ inputs.tflint-azurerm-version }}
+        run: |
+          if [ ! -f .tflint.hcl ]; then
+            cat > "$RUNNER_TEMP/.tflint.hcl" <<EOF
+          plugin "terraform" {
+            enabled = true
+            preset  = "all"
+          }
+
+          plugin "azurerm" {
+            enabled = true
+            version = "$AZURERM_RULESET"
+            source  = "github.com/terraform-linters/tflint-ruleset-azurerm"
+          }
+          EOF
+            export TFLINT_CONFIG_FILE="$RUNNER_TEMP/.tflint.hcl"
+          fi
+          tflint --init
+          tflint --recursive --format compact
+      - name: Check the README is up to date
+        env:
+          VERSION: ${{ inputs.terraform-docs-version }}
+        run: |
+          archive="terraform-docs-$VERSION-linux-amd64.tar.gz"
+          base="https://github.com/terraform-docs/terraform-docs/releases/download/$VERSION"
+          curl -fsSLo "$RUNNER_TEMP/$archive" "$base/$archive"
+          curl -fsSL "$base/terraform-docs-$VERSION.sha256sum" | grep " $archive\$" > "$RUNNER_TEMP/terraform-docs.sha256"
+          (cd "$RUNNER_TEMP" && sha256sum -c terraform-docs.sha256)
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" terraform-docs
+          if ! "$RUNNER_TEMP/terraform-docs" . --output-check; then
+            "$RUNNER_TEMP/terraform-docs" . > /dev/null
+            git diff
+            echo "::error::README.md is out of date; run terraform-docs $VERSION in the repository root and commit the result shown above"
+            exit 1
+          fi
+      - name: Scan for misconfigurations
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: ${{ inputs.trivy-severity }}
+          exit-code: "1"
+
+  terraform-test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        terraform: ${{ fromJSON(inputs.terraform-versions) }}
+    name: test (${{ matrix.terraform }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ matrix.terraform }}
+          terraform_wrapper: false
+      - name: Run terraform test
+        run: |
+          if [ -z "$(find tests -name '*.tftest.hcl' 2>/dev/null)" ]; then
+            echo "::error::The module has no tests in tests/*.tftest.hcl"
+            exit 1
+          fi
+          terraform init -backend=false -input=false
+          terraform test
+
+  # A single required check that does not change when the Terraform versions do.
+  test:
+    if: always()
+    needs: terraform-test
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Require every Terraform version to pass
+        env:
+          RESULT: ${{ needs.terraform-test.result }}
+        run: |
+          echo "terraform test: $RESULT"
+          [ "$RESULT" = "success" ]

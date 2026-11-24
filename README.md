@@ -8,6 +8,7 @@ Reusable GitHub Actions workflows for Think-Cube repositories.
 |---|---|
 | [`container-image.yml`](.github/workflows/container-image.yml) | Lint, test, scan, sign and publish a multi-arch container image |
 | [`helm-chart.yml`](.github/workflows/helm-chart.yml) | Lint, validate, install, sign and publish a Helm chart as an OCI artifact |
+| [`terraform-module.yml`](.github/workflows/terraform-module.yml) | Lint, scan and test a Terraform module |
 | [`version-check.yml`](.github/workflows/version-check.yml) | Open an issue when versions Dependabot does not track have newer releases |
 
 ## container-image
@@ -142,6 +143,53 @@ cosign verify ghcr.io/think-cube/charts/<chart>:<version> \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github\.com/Think-Cube/workflows/\.github/workflows/helm-chart\.yml@refs/tags/v.+$'
 ```
+
+## terraform-module
+
+Checks a Terraform module that is consumed straight from GitHub, so nothing is published. The `lint` job checks `terraform fmt`, validates the module and every directory in `examples/`, runs TFLint with all rules of the Terraform ruleset and the azurerm ruleset, checks that the tables in the README match `terraform-docs` and scans for misconfigurations with Trivy. The `test` job runs `terraform test` once for every Terraform version, so the oldest supported version is tested too. It fails when the module has no tests.
+
+Write the tests against mocked providers (`mock_provider`) so they need no cloud credentials.
+
+### Usage
+
+```yaml
+name: Module
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  module:
+    permissions:
+      contents: read
+    uses: Think-Cube/workflows/.github/workflows/terraform-module.yml@v1.4.0
+```
+
+The scheduled run catches new provider releases that break the module before its users do. Require the `module / lint` and `module / test` checks in the repository's ruleset; `module / test` passes only when the tests pass on every Terraform version.
+
+### Inputs
+
+| Input | Default | Description |
+|---|---|---|
+| `terraform-versions` | `["1.14.9", "1.17.2"]` | JSON array of Terraform versions to test with; the first one also runs the lint job |
+| `tflint-version` | `v0.66.0` | TFLint version |
+| `tflint-azurerm-version` | `0.33.0` | azurerm ruleset version, used when the repository has no `.tflint.hcl` |
+| `terraform-docs-version` | `v0.25.1` | terraform-docs version that checks the README |
+| `trivy-severity` | `CRITICAL,HIGH` | Misconfiguration severities that fail the build |
+
+A `.tflint.hcl` in the repository replaces the default configuration. The README needs `<!-- BEGIN_TF_DOCS -->` and `<!-- END_TF_DOCS -->` markers, and a `.terraform-docs.yml` sets how the tables look.
+
+### Releases
+
+Consumers pin a tag in the module source, for example `git::https://github.com/Think-Cube/terraform-azurerm-resource-group.git?ref=v1.0.0`, and Dependabot's `terraform` ecosystem proposes newer tags. A release is a `vX.Y.Z` tag with a GitHub release.
 
 ## version-check
 
